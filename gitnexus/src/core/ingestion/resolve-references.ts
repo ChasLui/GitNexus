@@ -41,12 +41,14 @@
 import {
   buildClassRegistry,
   buildFieldRegistry,
+  buildMacroRegistry,
   buildMethodRegistry,
   CLASS_KINDS,
   FIELD_KINDS,
   METHOD_KINDS,
   type ClassRegistry,
   type FieldRegistry,
+  type MacroRegistry,
   type MethodRegistry,
   type Reference,
   type ReferenceIndex,
@@ -57,6 +59,7 @@ import {
   type ScopeId,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { bindsTypeParameter } from './scope-resolution/scope/walkers.js';
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -64,12 +67,19 @@ export interface ResolveReferencesInput {
   readonly scopes: ScopeResolutionIndexes;
   /** Provider hooks consumed by the registries (e.g. `arityCompatibility`). */
   readonly providers?: RegistryProviders;
+  /** Required owner-keyed member lookup used by Step 2 receiver/MRO walks. */
+  readonly ownedMembersByOwner: RegistryContext['ownedMembersByOwner'];
 }
 
 export interface ResolveStats {
   readonly sitesProcessed: number;
   readonly referencesEmitted: number;
-  /** Sites where `Registry.lookup` returned no candidates. */
+  /**
+   * Sites that produced no `Reference`. Almost always "the registry returned no
+   * candidates", but it also counts a site declined before lookup because the
+   * name is bound as a type parameter here (#2899) — a shadowed annotation names
+   * no symbol in the graph, so "resolved to nothing" is the honest bucket for it.
+   */
   readonly unresolved: number;
 }
 
@@ -92,6 +102,7 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
     defs: scopes.defs,
     qualifiedNames: scopes.qualifiedNames,
     moduleScopes: scopes.moduleScopes,
+    ownedMembersByOwner: input.ownedMembersByOwner,
     methodDispatch: scopes.methodDispatch,
     providers,
   };
@@ -99,6 +110,7 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
   const classRegistry = buildClassRegistry(ctx);
   const methodRegistry = buildMethodRegistry(ctx);
   const fieldRegistry = buildFieldRegistry(ctx);
+  const macroRegistry = buildMacroRegistry(ctx);
 
   // bySourceScope is the canonical index; byTargetDef is derived from it.
   const bySourceScope = new Map<ScopeId, Reference[]>();
@@ -109,9 +121,21 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
   let unresolved = 0;
 
   for (const site of scopes.referenceSites) {
+    // value-ref sites resolve post-finalize (imports live in finalized
+    // bindings the registries can't see — same reason free calls need
+    // `emitFreeCallFallback`). `emitPropertyDispatchCalls` owns their
+    // resolution and emission entirely (#2437).
+    if (site.kind === 'value-ref') continue;
     sitesProcessed++;
 
-    const resolutions = lookupForSite(site, classRegistry, methodRegistry, fieldRegistry);
+    const resolutions = lookupForSite(
+      site,
+      classRegistry,
+      methodRegistry,
+      fieldRegistry,
+      macroRegistry,
+      scopes,
+    );
     if (resolutions.length === 0) {
       unresolved++;
       continue;
@@ -159,9 +183,16 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
  *   |------------------|-------------------|------------------------------|
  *   | `call`           | MethodRegistry    | METHOD_KINDS (Method/Func/Ctor)
  *   | `inherits`       | ClassRegistry     | CLASS_KINDS                  |
- *   | `type-reference` | ClassRegistry     | CLASS_KINDS                  |
+ *   | `type-reference` | ClassRegistry     | CLASS_KINDS (type-parameter shadow guard, #2899) |
  *   | `read`/`write`   | FieldRegistry     | FIELD_KINDS                  |
  *   | `import-use`     | tiered fallback   | METHOD ∪ CLASS ∪ FIELD       |
+ *   | `value-ref`      | (skipped here)    | post-finalize walker in `emitPropertyDispatchCalls` |
+ *   | `macro`          | MacroRegistry     | MACRO_KINDS (`Macro` only)   |
+ *
+ * `macro` has its own single-kind registry so a macro invocation
+ * (`log!(…)`) resolves ONLY to a `macro_rules! log` definition and never
+ * to a same-named free function — macros and functions are disjoint
+ * namespaces (the false-`CALLS`-edge class flagged in the #1934 review).
  *
  * `import-use` doesn't have a single registry — the imported name might
  * be a class, a function, or a constant. Try each in priority order and
@@ -174,6 +205,8 @@ function lookupForSite(
   classRegistry: ClassRegistry,
   methodRegistry: MethodRegistry,
   fieldRegistry: FieldRegistry,
+  macroRegistry: MacroRegistry,
+  scopes: ScopeResolutionIndexes,
 ): readonly Resolution[] {
   switch (site.kind) {
     case 'call': {
@@ -183,16 +216,78 @@ function lookupForSite(
       };
       return methodRegistry.lookup(site.name, site.inScope, opts);
     }
-    case 'inherits':
+    case 'inherits': {
+      return classRegistry.lookup(site.name, site.inScope);
+    }
     case 'type-reference': {
+      // A TYPE PARAMETER SHADOWS A DECLARED TYPE OF THE SAME NAME (#2899).
+      //
+      // `export function unwrap<Result>(value: Result): Result` names the
+      // parameter, not the `interface Result` next to it — tsc resolves BOTH
+      // annotations to the parameter. Nothing in the type-reference path knew
+      // that a parameter binds a name, so each annotation minted a `USES` edge
+      // into the interface at the same confidence as a real consumer and
+      // indistinguishable from one. Blast radius is every generic whose
+      // parameter name collides with a declared type — `Result`, `Key`,
+      // `Value`, `Item`, `Node`, `Options`, `Config`, `Props`, `State`.
+      //
+      // ASKED HERE, ON `site.name`, BECAUSE SHADOWING IS A PROPERTY OF THE NAME
+      // WRITTEN AT THE SITE. This is the last point that still holds the
+      // spelling — a `Reference` keeps only the resolved def — so a guard placed
+      // after resolution has to substitute the DEF's name for the written one
+      // and is then wrong in BOTH directions from the same substitution. It
+      // deletes a genuine edge wherever the two differ and the def's name
+      // happens to match a parameter (`import { Payload as ApiPayload }` written
+      // inside `pluck<Payload>`), and it keeps a false one wherever the def's
+      // name is qualified or position-suffixed and the written name is the
+      // parameter (`Inner` resolving to `Host.Inner`, or a function-local
+      // `Result@12:4`). Neither failure is recoverable from the resolved id,
+      // because the information the question needs was never in it.
+      //
+      // TYPE REFERENCES ONLY, which is what asking on `kind` rather than on the
+      // emitted EDGE TYPE buys. `mapReferenceKindToEdgeType` folds `value-ref`
+      // (#2437) and `macro` (#1934) into the same `USES` edge, and neither is a
+      // type annotation — a value or a macro whose name collides with an
+      // enclosing type parameter is a different construct in a different
+      // namespace, and dropping it would be a second false-negative class
+      // bought with the fix for the first.
+      //
+      // Reuses the predicate #2833 introduced for the CALL-receiver path, which
+      // stopped a workspace `class T` answering for `<T>` but never reached type
+      // references. Absence is not evidence there and is not here:
+      // `typeParameters` is populated only by languages whose captures were
+      // extended for it, so a POSITIVE match declines and an absent list changes
+      // nothing — which is what keeps every unconverted language unchanged.
+      if (bindsTypeParameter(site.inScope, site.name, scopes)) return [];
       return classRegistry.lookup(site.name, site.inScope);
     }
     case 'read':
     case 'write': {
       // Try field first; fall through to method then class so bare-name
       // reads of a function (e.g. `cb = save`) still resolve.
-      const fieldHits = fieldRegistry.lookup(site.name, site.inScope);
-      if (fieldHits.length > 0) return fieldHits;
+      const fieldOpts: Parameters<FieldRegistry['lookup']>[2] = {
+        ...(site.explicitReceiver !== undefined ? { explicitReceiver: site.explicitReceiver } : {}),
+      };
+      const fieldHits = fieldRegistry.lookup(site.name, site.inScope, fieldOpts);
+      // A BARE IDENTIFIER is not a member access. With no receiver there is no
+      // object whose `Property` this could be, so a hit on one is a false edge:
+      // in JS/TS/Python/Ruby a field read needs `this.` / `self.` / `@`, and the
+      // bare name means the nearest lexical binding instead.
+      //
+      // Observed: `class Box { baseUrl = '...'; pick() { const baseUrl = ...;
+      // return baseUrl; } }` linked the block-local read to `Box.baseUrl`,
+      // duplicating the legitimate `this.baseUrl` edge. That predates the
+      // TypeScript captures added here — JavaScript has emitted bare-identifier
+      // reads since A2 and no class fixture exercised the shadow.
+      //
+      // Callables are deliberately still reachable: `cb = save` naming a
+      // top-level function is a real bare-name reference, which is why the
+      // method/class fallbacks below are untouched.
+      const receiverlessFieldHits =
+        site.explicitReceiver === undefined
+          ? fieldHits.filter((hit) => hit.def?.type !== 'Property')
+          : fieldHits;
+      if (receiverlessFieldHits.length > 0) return receiverlessFieldHits;
       const methodHits = methodRegistry.lookup(site.name, site.inScope);
       if (methodHits.length > 0) return methodHits;
       return classRegistry.lookup(site.name, site.inScope);
@@ -207,6 +302,16 @@ function lookupForSite(
       if (methodHits.length > 0) return methodHits;
       return fieldRegistry.lookup(site.name, site.inScope);
     }
+    case 'value-ref': {
+      // Unreachable — filtered before lookup (post-finalize resolution in
+      // `emitPropertyDispatchCalls`, #2437). Kept for switch exhaustiveness.
+      return [];
+    }
+    case 'macro': {
+      // Macro-only namespace: resolves against `Macro`-labeled defs, never
+      // functions. No receiver, no arity — see `MacroRegistry`.
+      return macroRegistry.lookup(site.name, site.inScope);
+    }
   }
 }
 
@@ -217,6 +322,11 @@ function buildReference(site: ReferenceSite, top: Resolution): Reference {
     toDef: top.def.nodeId,
     atRange: site.atRange,
     kind: site.kind,
+    // The call form survives resolution so the graph bridge can mark
+    // construction sites (`callForm: 'constructor'`) on the CALLS edge it
+    // emits — a `Reference` otherwise keeps only the resolved def.
+    ...(site.kind === 'call' && site.callForm !== undefined ? { callForm: site.callForm } : {}),
+    ...(site.kind === 'call' && site.staticGated === true ? { staticGated: true } : {}),
     confidence: top.confidence,
     evidence: top.evidence,
   };

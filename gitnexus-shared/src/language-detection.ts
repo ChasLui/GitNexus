@@ -32,7 +32,18 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
   [SupportedLanguages.Python]: ['.py'],
   [SupportedLanguages.Java]: ['.java'],
   [SupportedLanguages.C]: ['.c'],
-  [SupportedLanguages.CPlusPlus]: ['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh'],
+  [SupportedLanguages.ObjectiveC]: ['.m', '.mm'],
+  [SupportedLanguages.CPlusPlus]: [
+    '.cpp',
+    '.cc',
+    '.cxx',
+    '.h',
+    '.hpp',
+    '.hxx',
+    '.hh',
+    '.cu',
+    '.cuh',
+  ],
   [SupportedLanguages.CSharp]: ['.cs'],
   [SupportedLanguages.Go]: ['.go'],
   [SupportedLanguages.Ruby]: ['.rb', '.rake', '.gemspec'],
@@ -43,6 +54,7 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
   [SupportedLanguages.Dart]: ['.dart'],
   [SupportedLanguages.Vue]: ['.vue'],
   [SupportedLanguages.Cobol]: ['.cbl', '.cob', '.cpy', '.cobol'],
+  [SupportedLanguages.Zig]: ['.zig'],
 } satisfies Record<SupportedLanguages, readonly string[]>; // Ensure exhaustiveness
 
 /** Pre-built reverse lookup: extension → language (built once at module load). */
@@ -57,10 +69,20 @@ for (const [lang, exts] of Object.entries(EXTENSION_MAP) as [
 }
 
 /**
+ * Laravel Blade templates are source templates whose filename convention ends
+ * in `.blade.php`.  They may contain PHP snippets, but the full file is not a
+ * pure PHP translation unit and must not enter the generic PHP provider path.
+ */
+export const isBladeTemplateFilename = (filePath: string): boolean =>
+  filePath.replace(/\\/g, '/').toLowerCase().endsWith('.blade.php');
+
+/**
  * Map file extension to SupportedLanguage enum.
  * Returns null if the file extension is not recognized.
  */
 export const getLanguageFromFilename = (filename: string): SupportedLanguages | null => {
+  if (isBladeTemplateFilename(filename)) return null;
+
   // Fast path: check the extension map
   const lastDot = filename.lastIndexOf('.');
   if (lastDot >= 0) {
@@ -90,6 +112,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Python]: 'python',
   [SupportedLanguages.Java]: 'java',
   [SupportedLanguages.C]: 'c',
+  [SupportedLanguages.ObjectiveC]: 'objectivec',
   [SupportedLanguages.CPlusPlus]: 'cpp',
   [SupportedLanguages.CSharp]: 'csharp',
   [SupportedLanguages.Go]: 'go',
@@ -101,6 +124,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Dart]: 'dart',
   [SupportedLanguages.Vue]: 'typescript',
   [SupportedLanguages.Cobol]: 'cobol',
+  [SupportedLanguages.Zig]: 'zig',
 } satisfies Record<SupportedLanguages, string>; // Ensure exhaustiveness
 
 /** Non-code file extensions → Prism-compatible syntax identifiers */
@@ -138,6 +162,8 @@ const AUXILIARY_BASENAME_MAP: Record<string, string> = {
  * Returns 'text' for unrecognised files.
  */
 export const getSyntaxLanguageFromFilename = (filePath: string): string => {
+  if (isBladeTemplateFilename(filePath)) return 'markup';
+
   const lang = getLanguageFromFilename(filePath);
   if (lang) return SYNTAX_MAP[lang];
   const ext = filePath.split('.').pop()?.toLowerCase();

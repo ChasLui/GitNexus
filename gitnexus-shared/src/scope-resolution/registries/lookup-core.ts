@@ -27,8 +27,10 @@
  *   is true, resolve the receiver's type at `startScope` (from
  *   `scope.typeBindings`), then walk the MRO via
  *   `MethodDispatchIndex.mroFor(ownerDefId)`. Membership per owner comes
- *   through `RegistryContext.methodDispatch` + owner lookups into
- *   `scope.ownedDefs`; each hit records a raw signal with the owner's
+ *   through an optional `RegistryContext.ownedMembersByOwner` hook when
+ *   supplied (`undefined` → fall back to `defs.byId`; `[]` → indexed
+ *   miss), otherwise via the compatibility fallback scan over
+ *   `defs.byId`; each hit records a raw signal with the owner's
  *   MRO depth.
  *
  * **Step 3 — Owner-scoped contributor.** When
@@ -106,7 +108,31 @@ export function lookupCore(
   const perCandidate = new Map<DefId, CandidateState>();
 
   // ── Step 1: lexical scope-chain walk ──────────────────────────────────
-  const lexicalShadowed = walkLexicalChain(name, startScope, acceptedKinds, ctx, perCandidate);
+  //
+  // SKIPPED for a NAMED explicit receiver. `recv.name` names a MEMBER of
+  // whatever `recv` denotes; it is not a lexical reference to `name`, so a
+  // binding of the bare tail name in an enclosing scope is never the right
+  // answer. Steps 2 and 3 (receiver type / owner members) are the routes.
+  //
+  // Without this, `options.baseUrl` bound to an unrelated function-local
+  // `const baseUrl` in the same file. This is the residual half of the defect
+  // JS/TS block scopes narrowed in #2699 — blocks moved nested-block locals
+  // off the chain, but a local declared directly in the function body stayed
+  // on it, and no amount of extra scopes reaches that case.
+  //
+  // `this` / `self` are deliberately EXEMPT. For a self-receiver the members
+  // and the lexical chain legitimately overlap — a class body is itself a
+  // scope that binds its members — so Step 1 is a real resolution route
+  // there, not a coincidence. Measured on a 762-file corpus: skipping Step 1
+  // for every explicit receiver dropped 711 edges, of which 43 were
+  // `this.member` reads reaching their own owner. Exempting the self names
+  // keeps those and still removes the 668 named-receiver false positives.
+  const skipLexical =
+    params.explicitReceiver !== undefined &&
+    !IMPLICIT_RECEIVERS.includes(params.explicitReceiver.name);
+  const lexicalShadowed = skipLexical
+    ? false
+    : walkLexicalChain(name, startScope, acceptedKinds, ctx, perCandidate);
 
   // ── Step 2: type-binding / MRO walk (methods/fields) ──────────────────
   if (params.useReceiverTypeBinding && ctx.methodDispatch !== undefined) {
@@ -263,13 +289,14 @@ function walkReceiverTypeBinding(
   // Walk the owner itself at depth 0, then its MRO chain.
   const walk: DefId[] = [ownerDefId, ...ctx.methodDispatch.mroFor(ownerDefId)];
 
-  for (let mroDepth = 0; mroDepth < walk.length; mroDepth++) {
-    const currentOwnerId = walk[mroDepth]!;
+  let mroDepth = 0;
+  for (const currentOwnerId of walk) {
     const members = collectOwnedMembers(currentOwnerId, name, ctx);
     for (const def of members) {
       if (!acceptedKinds.has(def.type)) continue;
       recordTypeBindingHit(perCandidate, def, mroDepth, ownerDefId);
     }
+    mroDepth++;
   }
 }
 
@@ -294,7 +321,33 @@ function resolveReceiverOwner(
   return undefined;
 }
 
-const IMPLICIT_RECEIVERS: readonly string[] = Object.freeze(['self', 'this']);
+/**
+ * Names that denote the enclosing instance rather than an arbitrary object.
+ *
+ * Two consumers, and both want the same set: `resolveReceiverOwner` above
+ * tries them when no explicit receiver is present, and the Step-1 skip in
+ * `lookupCore` exempts them because for a SELF receiver the members and the
+ * lexical chain legitimately overlap — a class body is itself a scope that
+ * binds its members — whereas for a named receiver they never do.
+ *
+ * `$this` is matched because the receiver name arrives as the reference node's
+ * RAW SOURCE TEXT (`extractExplicitReceiver` returns `cap.text` verbatim), so
+ * PHP's `$this->x` presents as `"$this"`, sigil included. Listing the spelling
+ * keeps this a data table rather than a language switch — this module resolves
+ * language behaviour through `providers.*` and `params` only (see the header)
+ * — and it follows the ingestion-side twin, `THIS_RECEIVERS` in
+ * `gitnexus/src/core/ingestion/type-env.ts`, which has always listed the
+ * sigil'd spelling rather than stripping it. Stripping would carry the same
+ * false-positive surface anyway (a JS variable literally named `$this`).
+ *
+ * That twin also lists `Me`, deliberately NOT mirrored here: no entry in
+ * `SupportedLanguages` uses it, so it can only ever exempt a variable that
+ * happens to be called `Me`. The two lists are otherwise the same set, and
+ * that equality — plus the `Me` exemption in both directions — is now ENFORCED
+ * by `gitnexus/test/unit/receiver-twin-list-drift.test.ts`. Editing either list
+ * without the other fails there.
+ */
+const IMPLICIT_RECEIVERS: readonly string[] = Object.freeze(['self', 'this', '$this']);
 
 function lookupReceiverType(
   startScope: ScopeId,
@@ -323,6 +376,12 @@ function lookupReceiverType(
       // intentionally do NOT re-implement a simple-name fallback here.
       return undefined;
     }
+    // The scope binds this receiver itself but carries no type for it — a
+    // JS/TS ordinary `function` whose `this` is bound at call time, not the
+    // enclosing instance (#2701). Stop rather than borrowing an enclosing
+    // scope's binding; see `Scope.ownsReceivers`. Mirrors the same gate in
+    // the ingestion-side twin of this walk, `findReceiverTypeBinding`.
+    if (scope.ownsReceivers?.has(receiverName) === true) return undefined;
     currentId = scope.parent;
   }
   return undefined;
@@ -333,23 +392,7 @@ function collectOwnedMembers(
   memberName: string,
   ctx: RegistryContext,
 ): readonly SymbolDefinition[] {
-  // An owner's members are defs whose `ownerId === ownerDefId` and whose
-  // simple name matches `memberName`. We iterate `defs.byId` — O(D) per
-  // call today. A future by-owner index would make this O(K); tracked as
-  // a follow-up optimization before Ring 3 flips go production.
-  const out: SymbolDefinition[] = [];
-  for (const def of ctx.defs.byId.values()) {
-    if (def.ownerId !== ownerDefId) continue;
-    if (simpleNameOf(def) !== memberName) continue;
-    out.push(def);
-  }
-  return out;
-}
-
-function simpleNameOf(def: SymbolDefinition): string | undefined {
-  if (def.qualifiedName === undefined || def.qualifiedName.length === 0) return undefined;
-  const dot = def.qualifiedName.lastIndexOf('.');
-  return dot === -1 ? def.qualifiedName : def.qualifiedName.slice(dot + 1);
+  return ctx.ownedMembersByOwner(ownerDefId, memberName);
 }
 
 function recordTypeBindingHit(

@@ -2,10 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { createRequire } from 'module';
+import { packageVersion } from '../../src/core/package-version.js';
 
-const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
-  .version;
+const PKG_VERSION = packageVersion();
 const NPX_REF = `gitnexus@${PKG_VERSION}`;
 
 const execFileMock = vi.fn((...args: any[]) => {
@@ -15,8 +14,13 @@ const execFileMock = vi.fn((...args: any[]) => {
   }
 });
 
+const execFileSyncMock = vi.fn(() => {
+  throw new Error('not found');
+});
+
 vi.mock('child_process', () => ({
   execFile: execFileMock,
+  execFileSync: execFileSyncMock,
 }));
 
 describe('setupCommand codex execution', () => {
@@ -69,7 +73,22 @@ describe('setupCommand codex execution', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'codex',
       ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
-      { shell: true },
+      { shell: true, windowsHide: true },
+      expect.any(Function),
+    );
+  });
+
+  it('uses Windows npx fallback arguments when where returns only a non-wrapper shim', async () => {
+    execFileSyncMock.mockReturnValueOnce('C:\\Users\\dev\\AppData\\Roaming\\npm\\gitnexus\n');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+
+    await setupCommand();
+
+    expect(execFileMock).toHaveBeenCalledWith(
+      'codex',
+      ['mcp', 'add', 'gitnexus', '--', 'cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'],
+      { shell: true, windowsHide: true },
       expect.any(Function),
     );
   });
@@ -84,7 +103,7 @@ describe('setupCommand codex execution', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'codex',
       ['mcp', 'add', 'gitnexus', '--', 'npx', '-y', NPX_REF, 'mcp'],
-      { shell: false },
+      { shell: false, windowsHide: true },
       expect.any(Function),
     );
 

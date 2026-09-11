@@ -39,27 +39,63 @@ const JAVA_SCOPE_QUERY = `
 (record_declaration) @scope.class
 (annotation_type_declaration) @scope.class
 
+;; Anonymous class body: \`new Runnable() { public void run() {} }\`.
+;; Without its own scope, a method's auto-hoist (scope-extractor.ts) has
+;; nowhere to stop and leaks the name past the anonymous class into the
+;; enclosing scope -- the same failure mode fixed for TS/JS object
+;; literals (#2545).
+(object_creation_expression
+  (class_body) @scope.class)
+
+;; Enum constant body: \`enum E { A { public void hook() {} } }\` --
+;; javac's other anonymous-class shape (E$N), same scope-boundary need
+;; and same class_body anchor (#2555).
+(enum_constant
+  body: (class_body) @scope.class)
+
 (method_declaration) @scope.function
 (constructor_declaration) @scope.function
+(compact_constructor_declaration) @scope.function
 
 ;; Declarations — types
+;; Optional-quantifier capture rather than a second pattern: a separate rule
+;; would make every GENERIC declaration match twice under one def id, leaving
+;; match order to decide which twin kept the parameters.
 (class_declaration
-  name: (identifier) @declaration.name) @declaration.class
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.class
 
 (interface_declaration
-  name: (identifier) @declaration.name) @declaration.interface
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.interface
 
 (enum_declaration
   name: (identifier) @declaration.name) @declaration.enum
 
 (record_declaration
-  name: (identifier) @declaration.name) @declaration.record
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.record
 
 (annotation_type_declaration
   name: (identifier) @declaration.name) @declaration.class
 
+;; Class annotation syntax is carried to post-resolution enrichment. Keeping
+;; this in the existing scope query avoids a second AST build/traversal.
+(class_declaration
+  (modifiers
+    [
+      (marker_annotation name: (_) @class-annotation.name)
+      (annotation name: (_) @class-annotation.name)
+    ])) @class-annotation.class
+
 ;; Declarations — methods / constructors
+;;
+;; A generic METHOD's parameters are read for the same reason a generic type's
+;; are (#2912 review): \`<T> boolean runAny(Validator<T> v)\` writes a receiver
+;; whose argument is a type VARIABLE, and a pass that cannot tell that from a
+;; concrete type prunes every implementor from the call's dispatch fan-out.
 (method_declaration
+  type_parameters: (type_parameters)? @declaration.type-parameters
   name: (identifier) @declaration.name) @declaration.method
 
 (constructor_declaration
@@ -102,6 +138,47 @@ const JAVA_SCOPE_QUERY = `
   declarator: (variable_declarator
     name: (identifier) @type-binding.name)) @type-binding.annotation
 
+;; Type bindings — var u = svc.getUser(); (Java 10+ call-result inference)
+(local_variable_declaration
+  type: (type_identifier) @_var_type
+  (#eq? @_var_type "var")
+  declarator: (variable_declarator
+    name: (identifier) @type-binding.name
+    value: (method_invocation
+      name: (identifier) @type-binding.type))) @type-binding.call-result
+
+;; Type bindings — var alias = u; (Java 10+ alias inference)
+(local_variable_declaration
+  type: (type_identifier) @_var_type
+  (#eq? @_var_type "var")
+  declarator: (variable_declarator
+    name: (identifier) @type-binding.name
+    value: (identifier) @type-binding.type)) @type-binding.alias
+
+;; Type bindings — var addr = user.address; (Java 10+ field-access alias)
+(local_variable_declaration
+  type: (type_identifier) @_var_type
+  (#eq? @_var_type "var")
+  declarator: (variable_declarator
+    name: (identifier) @type-binding.name
+    value: (field_access
+      field: (identifier) @type-binding.type))) @type-binding.alias
+
+;; Type bindings — enhanced-for with var: for (var user : users)
+(enhanced_for_statement
+  (type_identifier) @_var_type
+  (#eq? @_var_type "var")
+  (identifier) @type-binding.name
+  (identifier) @type-binding.type) @type-binding.alias
+
+;; Enhanced-for with var + method iterable: for (var user : data.values())
+(enhanced_for_statement
+  (type_identifier) @_var_type
+  (#eq? @_var_type "var")
+  (identifier) @type-binding.name
+  (method_invocation
+    object: (identifier) @type-binding.type)) @type-binding.alias
+
 ;; Type bindings — var u = new User(); (Java 10+ local variable type inference)
 ;; tree-sitter-java parses \`var\` as a \`type_identifier\` with text "var".
 ;; The type-binding.constructor anchor fires when the rhs is an
@@ -143,6 +220,16 @@ const JAVA_SCOPE_QUERY = `
   type: (generic_type) @type-binding.type
   name: (identifier) @type-binding.name) @type-binding.annotation
 
+;; Type bindings — instanceof pattern (Java 16+): if (obj instanceof User user)
+(instanceof_expression
+  (type_identifier) @type-binding.type
+  (identifier) @type-binding.name) @type-binding.pattern
+
+;; Type bindings — switch case pattern (Java 21+): case User user ->
+(type_pattern
+  (type_identifier) @type-binding.type
+  (identifier) @type-binding.name) @type-binding.pattern
+
 ;; References — all method calls: foo() and obj.method()
 ;; tree-sitter-java's query engine drops negation-based \`!object\`
 ;; patterns when a positive \`object:\` pattern exists for the same
@@ -163,8 +250,47 @@ const JAVA_SCOPE_QUERY = `
   type: (generic_type
     (type_identifier) @reference.name)) @reference.call.constructor
 
+;; References — qualified constructor calls: new pkg.Foo(), new a.b.Foo() (F35 #1928)
+;; tree-sitter-java parses \`pkg.Foo\` as a scoped_type_identifier whose final
+;; child is the simple type. Bind that tail as @reference.name (trailing \`.\`
+;; anchor = last child) so resolution targets \`Foo\`, not the raw \`pkg.Foo\` text.
+;; Mirrors the TS/JS new-expression qualified-constructor capture.
 (object_creation_expression
-  type: (scoped_type_identifier) @reference.call.constructor.qualified) @reference.call.constructor
+  type: (scoped_type_identifier
+    (type_identifier) @reference.name .) @reference.call.constructor.qualified) @reference.call.constructor
+
+;; References — qualified + generic constructor calls: new pkg.Box<T>() (F35 #1928)
+;; The base is a generic_type whose first child is a scoped_type_identifier, so
+;; neither the simple-generic nor the plain-scoped arm above matches it. Bind the
+;; scoped tail as @reference.name.
+(object_creation_expression
+  type: (generic_type
+    (scoped_type_identifier
+      (type_identifier) @reference.name .) @reference.call.constructor.qualified)) @reference.call.constructor
+
+;; References — method references: User::getName, obj::method
+(method_reference
+  (identifier) @reference.receiver
+  (identifier) @reference.name) @reference.call.member
+
+;; References — this::method and super::method
+(method_reference
+  (this) @reference.receiver
+  (identifier) @reference.name) @reference.call.member
+
+(method_reference
+  (super) @reference.receiver
+  (identifier) @reference.name) @reference.call.member
+
+;; References — field_access::method: responseBuilder::buildResponse
+(method_reference
+  (field_access) @reference.receiver
+  (identifier) @reference.name) @reference.call.member
+
+;; References — constructor references: User::new
+(method_reference
+  (identifier) @reference.name
+  "new") @reference.call.constructor
 
 ;; References — field/property writes: obj.name = "x"
 (assignment_expression

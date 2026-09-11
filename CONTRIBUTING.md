@@ -13,10 +13,21 @@ This project uses the [PolyForm Noncommercial License 1.0.0](https://polyformpro
 
 ## Development setup
 
+**Prerequisites:** Node.js — `gitnexus/` requires `^22.18.0 || >=24.11.0` and `gitnexus-web/` requires `^20.19.0 || >=22.12.0` (enforced via the `engines` field in each package). Use `nvm install` to match the local version.
+
 1. Clone the repository.
-2. **CLI / MCP package:** `cd gitnexus && npm install && npm run build`
-3. **Web UI (if needed):** `cd gitnexus-web && npm install`
-4. Run tests as described in [TESTING.md](TESTING.md).
+2. **Shared package:** `cd gitnexus-shared && npm install && npm run build`
+3. **CLI / MCP package:** `cd ../gitnexus && npm install && npm run build`
+4. **Web UI (if needed):** `cd ../gitnexus-web && npm install`
+5. Run tests as described in [TESTING.md](TESTING.md).
+
+The CLI build imports `gitnexus-shared`, so a fresh clone must install and build
+the shared package before running `npm install` in `gitnexus/`. This is the same
+order used by the repository's `setup-gitnexus` CI action.
+
+### Containerized development (optional)
+
+If you prefer an isolated environment with Claude Code, OpenAI Codex CLI, and Cursor CLI pre-installed, open the repo in VS Code with the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) and run **Dev Containers: Reopen in Container**. See [`.devcontainer/README.md`](.devcontainer/README.md) for first-time auth flows and Windows WSL2 setup.
 
 ## Branch and pull requests
 
@@ -62,6 +73,7 @@ Commits within a PR may use any style — only the **merged PR title** shows up 
 - [ ] Typecheck passes: `npx tsc --noEmit` in `gitnexus/` and `npx tsc -b --noEmit` in `gitnexus-web/`.
 - [ ] No secrets, tokens, or machine-specific paths committed.
 - [ ] Documentation updated if behavior or public CLI/MCP contract changes.
+- [ ] Every new `GITNEXUS_*` environment variable has a row in the **Environment variables** table in [README.md](README.md) — variable, default, effect, and when to tune it.
 - [ ] Pre-commit hook runs clean (`.husky/pre-commit` — formatting via lint-staged + typecheck for staged packages; tests run in CI only).
 
 ## Code review
@@ -138,22 +150,40 @@ Re-invoking `/autofix` after a successful apply is a safe no-op — the workflow
 
 **Sensitive paths.** The apply workflow refuses any patch that touches `.github/` (workflow files, CODEOWNERS, dependabot config). A malicious PR could ship a custom prettier or ESLint config that reformats workflow YAML; if accepted, those edits would be pushed under `contents: write` without human review. Apply formatter changes to files under `.github/` manually in a normal commit so they get the same review every other workflow change gets.
 
+### Vendored tree-sitter grammars
+
+`.github/vendored-grammars.json` is the **single source of truth** for the vendored tree-sitter grammar **set** and each grammar's policy `hold` (the ones shipped from `gitnexus/vendor/<name>` rather than installed from npm). It lists each grammar's name, upstream coords (`npm` or `github`), and any `hold`. The monitor resolves upstreams from it; the readiness report keeps its own upstream-drift coords and reads vendored ABIs from `gitnexus/vendor/`. Two workflows read it:
+
+- `grammar-update-monitor.yml` (`.github/scripts/update-vendored-grammars.mjs`) — weekly; opens auto-PRs re-vendoring ABI-compatible upstream updates.
+- `tree-sitter-upgrade-readiness.yml` (`.github/scripts/check-tree-sitter-upgrade-readiness.py`) — daily; renders the tree-sitter-0.25 readiness report (issue #858), reading each vendored grammar's ABI from `gitnexus/vendor/<name>/src/parser.c`.
+
+Sharing the manifest keeps the two aligned: a consistency-guard test asserts the manifest set equals the `gitnexus/vendor/tree-sitter-*` directories. **When you vendor a new grammar (or remove one), update `.github/vendored-grammars.json` in the same change** — otherwise that guard fails CI and the readiness report regresses to `?` placeholders.
+
 ## AI-assisted contributions
 
 If you use coding agents, follow project context files (e.g. `AGENTS.md`, `CLAUDE.md`) and avoid drive-by refactors unrelated to the issue. Prefer incremental, test-backed changes.
 
 ## Releases
 
-Two publish workflows ship `gitnexus` to npm:
+One workflow ships `gitnexus` to npm — `.github/workflows/publish.yml`. It
+routes between two modes based on the triggering event:
 
-- **Stable** (`.github/workflows/publish.yml`) — triggered by pushing any `v*`
-  tag. Publishes to the `latest` dist-tag with a changelog-backed GitHub
-  release. Maintainers are expected to tag from `main` as a convention; the
-  workflow itself does not enforce branch reachability.
-- **Release Candidate** (`.github/workflows/release-candidate.yml`) — runs on
-  every push to `main` (typically a merged PR) plus manual dispatch. Docs-only
-  changes are skipped via `paths-ignore`. Publishes to the `rc` dist-tag with
-  version `X.Y.Z-rc.N` and a GitHub prerelease, where:
+- **Stable mode** — triggered by pushing any `v<X.Y.Z>` tag (no `-rc.*`
+  suffix; RC tags are excluded at trigger via a negative glob). Publishes to
+  the `latest` dist-tag with a changelog-backed GitHub release. Maintainers
+  are expected to tag from `main` as a convention; the workflow itself does
+  not enforce branch reachability. No Docker build (RC-only). Before cutting a
+  stable release, keep `gitnexus/package.json`,
+  `gitnexus-claude-plugin/.claude-plugin/plugin.json`,
+  `.claude-plugin/marketplace.json`,
+  `gitnexus-claude-plugin/.codex-plugin/plugin.json`,
+  `.agents/plugins/marketplace.json`, and the matching `CHANGELOG.md` entry in
+  lockstep — the always-on `gitnexus` unit suite now fails if those manifest
+  versions drift.
+- **Release-candidate mode** — runs on every push to `main` (typically a
+  merged PR) plus manual `workflow_dispatch`. Docs-only changes are skipped
+  via `paths-ignore`. Publishes to the `rc` dist-tag with version
+  `X.Y.Z-rc.N` and a GitHub prerelease, where:
   - `X.Y.Z` is selected automatically. On push (and on dispatch with
     `bump: auto`, the default) the workflow **continues the active rc cycle**:
     if the registry already has `X.Y.Z-rc.*` versions with `X.Y.Z` > current
@@ -170,36 +200,64 @@ Two publish workflows ship `gitnexus` to npm:
     caller's ref — see README.md § Docker for the verify command).
 
   Idempotency: the workflow pushes an `rc/<HEAD_SHA>` marker tag and a
-  `v<RC>` release tag **atomically, before** calling `npm publish`. The guard
-  refuses to re-run once the marker exists, so a post-publish failure will
-  not mint a duplicate rc for the same commit. The `v<RC>` tag points at a
-  detached release commit whose `package.json` matches the npm tarball
-  exactly (traceable releases). Recovery after a partial failure:
+  `v<RC>` release tag **atomically, before** calling `npm publish`. The
+  RC guard refuses to re-run once the marker exists, so a post-publish
+  failure will not mint a duplicate rc for the same commit. The `v<RC>`
+  tag points at a detached release commit whose `package.json` matches
+  the npm tarball exactly (traceable releases). The RC tag is excluded
+  from this workflow's `push: tags:` filter, so it does **not** re-trigger
+  publishing — preventing the double-publish failure mode tracked in #1609.
+  Recovery after a partial failure: the workflow's `if: failure()` cleanup
+  step in the `publish` job auto-deletes the v-tag and marker on most
+  post-publish failures, so the typical retry is just:
+
+  ```bash
+  gh workflow run publish.yml --ref main -f force=true
+  # or push a new commit to main, which will cut a fresh RC
+  ```
+
+  If auto-cleanup didn't run (e.g. the cleanup step itself failed, or the
+  failure happened in the route/rc-guard phase before the marker was
+  pushed), manual cleanup is:
 
   ```bash
   git push --delete origin rc/<HEAD_SHA> v<RC>
-  # then redispatch the workflow with force: true
+  # then redispatch with force: true
   ```
+
+  **Release-PR-skip subject pattern.** The rc-guard job recognizes a
+  squash-merged release commit by matching the commit subject against
+  `^chore: release vX.Y.Z` (optionally followed by ` (#NNNN)` for the
+  squash-merge PR-number suffix). Match is case-insensitive — `Chore: Release v1.2.3`
+  works too. PRs that should suppress the RC build must either use this
+  subject shape, or carry the `release` label so the label-based fallback
+  fires. Other release-style subjects (`chore(release): v1.2.3`,
+  `release: v1.2.3`) will NOT trigger the skip — please name the release
+  PR exactly `chore: release vX.Y.Z` to keep the dedup deterministic.
 
   **Docker-only partial failure:** if `publish` succeeds (npm tarball + tags
   are live) but the `docker` job subsequently fails (e.g. GHCR flakiness),
   the npm RC is already published and the `rc/<HEAD_SHA>` marker is in place.
-  Re-running `release-candidate.yml` with `force: true` will abort at the
-  "Version already exists on npm" guard. To recover without cutting a new RC:
+  Recovery without cutting a new RC:
 
   ```bash
-  # 1. Manually trigger only the docker workflow, passing the existing RC tag:
-  gh workflow run docker.yml --ref main -f tag=v<RC_VERSION>
-  # (requires a workflow_dispatch trigger on docker.yml — see note below)
+  # Re-run only the failed docker job from the original workflow run:
+  gh run rerun <run-id> --failed
   ```
 
-  Because `docker.yml` intentionally has no `workflow_dispatch` (images are
-  tag-driven by design), the practical recovery options are:
-  - Wait for the next commit on `main`, which will cut a new RC that includes
-    the Docker build.
-  - Manually run `docker build` + `docker push` locally and sign with Cosign
-    against the same digest.
-  - Delete `rc/<HEAD_SHA>` and `v<RC>` tags, then redispatch with `force: true` to re-run the full RC pipeline (cuts a new RC number).
+  Find the run ID via `gh run list --workflow=publish.yml --branch main`.
+  `docker.yml` intentionally has no `workflow_dispatch` trigger (images are
+  tag-driven by design), so the gh-run-rerun path is the supported recovery.
+
+  **GitHub Release transient failure** (npm publish succeeded, Release step
+  failed): the npm artifact is live but no GitHub Release page exists.
+  Recover by either re-running the failed job (`gh run rerun <run-id> --failed`),
+  or creating the Release manually:
+
+  ```bash
+  gh release create v<RC> --prerelease --generate-notes        # RC
+  gh release create v<X.Y.Z> --notes-file gitnexus/CHANGELOG.md # stable
+  ```
 
 The rc workflow never moves `latest`. To verify after a change, inspect dist-tags:
 

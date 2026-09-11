@@ -1,9 +1,11 @@
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
+import type { ParameterTypeClass } from 'gitnexus-shared';
 
 export interface CppArityInfo {
   parameterCount?: number;
   requiredParameterCount?: number;
   parameterTypes?: string[];
+  parameterTypeClasses?: ParameterTypeClass[];
 }
 
 /**
@@ -31,7 +33,6 @@ export function computeCppDeclarationArity(node: SyntaxNode): CppArityInfo {
     if (
       child.type === 'parameter_declaration' ||
       child.type === 'optional_parameter_declaration' ||
-      child.type === 'variadic_parameter' ||
       child.type === 'variadic_parameter_declaration'
     ) {
       params.push(child);
@@ -58,11 +59,7 @@ export function computeCppDeclarationArity(node: SyntaxNode): CppArityInfo {
   // token in tree-sitter-cpp, detected via `hasEllipsis` above.
   // C++ parameter packs: `template<typename... Ts> void foo(Ts... args)` —
   // detected as `variadic_parameter_declaration`.
-  const isVariadic =
-    hasEllipsis ||
-    params.some(
-      (p) => p.type === 'variadic_parameter' || p.type === 'variadic_parameter_declaration',
-    );
+  const isVariadic = hasEllipsis || params.some((p) => p.type === 'variadic_parameter_declaration');
   const optionalCount = params.filter((p) => p.type === 'optional_parameter_declaration').length;
   const requiredCount = params.filter(
     (p) =>
@@ -73,26 +70,32 @@ export function computeCppDeclarationArity(node: SyntaxNode): CppArityInfo {
   const totalNonVariadic = requiredCount + optionalCount;
 
   const types: string[] = [];
+  const typeClasses: ParameterTypeClass[] = [];
   for (const p of params) {
-    if (p.type === 'variadic_parameter') {
-      types.push('...');
-    } else if (p.type === 'variadic_parameter_declaration') {
+    if (p.type === 'variadic_parameter_declaration') {
       // Parameter pack: treated as variadic
       types.push('...');
+      typeClasses.push(unknownTypeClass('...'));
     } else {
       const typeNode = p.childForFieldName('type');
-      types.push(normalizeCppParamType(typeNode?.text ?? 'unknown'));
+      const rawType = typeNode?.text ?? 'unknown';
+      types.push(normalizeCppParamType(rawType));
+      typeClasses.push(
+        classifyCppParameterType(rawType, p.childForFieldName('declarator')?.text, p.text),
+      );
     }
   }
   // Append '...' for C-style variadic if not already in types
   if (hasEllipsis && !types.includes('...')) {
     types.push('...');
+    typeClasses.push(unknownTypeClass('...'));
   }
 
   return {
     parameterCount: isVariadic ? undefined : totalNonVariadic,
     requiredParameterCount: requiredCount,
     parameterTypes: types,
+    parameterTypeClasses: typeClasses,
   };
 }
 
@@ -120,8 +123,14 @@ export function computeCppCallArity(node: SyntaxNode): number {
  * so that `narrowOverloadCandidates` can match against literal-inferred
  * argument types (e.g. `inferCppLiteralType` returns `'string'` for
  * string literals, not `'std::string'`).
+ *
+ * This intentionally remains coarse and graph-ID-stable: cv-qualifiers,
+ * reference markers, and pointer markers are stripped here. C++ callers
+ * that need those distinctions should read `parameterTypeClasses`, which
+ * is an additive sidecar and does not participate in overload node ID
+ * hashing.
  */
-function normalizeCppParamType(raw: string): string {
+export function normalizeCppParamType(raw: string): string {
   let t = raw.trim();
   // Strip const, volatile, etc.
   t = t.replace(/\b(const|volatile|restrict|mutable|constexpr)\b/g, '').trim();
@@ -158,6 +167,86 @@ function normalizeCppParamType(raw: string): string {
   return STD_MAP[t] ?? t;
 }
 
+export function classifyCppParameterType(
+  rawType: string,
+  declaratorText?: string,
+  fullParameterText?: string,
+): ParameterTypeClass {
+  const source = fullParameterText ?? `${rawType} ${declaratorText ?? ''}`.trim();
+  if (rawType === 'unknown') return unknownTypeClass('unknown');
+
+  const hasConst = /\bconst\b/.test(source);
+  const hasVolatile = /\bvolatile\b/.test(source);
+  const cv: ParameterTypeClass['cv'] =
+    hasConst && hasVolatile
+      ? 'const volatile'
+      : hasConst
+        ? 'const'
+        : hasVolatile
+          ? 'volatile'
+          : 'none';
+
+  const pointerDepth = (source.match(/\*/g) ?? []).length;
+  const indirection: ParameterTypeClass['indirection'] =
+    pointerDepth > 0
+      ? 'pointer'
+      : /&&/.test(source)
+        ? 'rvalue-ref'
+        : /&/.test(source)
+          ? 'lvalue-ref'
+          : 'value';
+
+  return {
+    base: normalizeCppParamType(rawType),
+    cv,
+    indirection,
+    pointerDepth,
+    ...templateArgumentsFor(`${source} ${rawType} ${declaratorText ?? ''}`),
+  };
+}
+
+function unknownTypeClass(base: string): ParameterTypeClass {
+  return {
+    base,
+    cv: 'unknown',
+    indirection: 'unknown',
+    pointerDepth: 0,
+  };
+}
+
+function templateArgumentsFor(rawType: string): Pick<ParameterTypeClass, 'templateArguments'> {
+  const args = parseTopLevelTemplateArguments(rawType);
+  return args === undefined ? {} : { templateArguments: args };
+}
+
+function parseTopLevelTemplateArguments(rawType: string): string[] | undefined {
+  const start = rawType.indexOf('<');
+  if (start < 0) return undefined;
+
+  const args: string[] = [];
+  let depth = 0;
+  let argStart = start + 1;
+  for (let i = start + 1; i < rawType.length; i++) {
+    const ch = rawType[i];
+    if (ch === '<') {
+      depth++;
+    } else if (ch === '>') {
+      if (depth === 0) {
+        const finalArg = rawType.slice(argStart, i).trim();
+        if (finalArg.length > 0) args.push(normalizeCppParamType(finalArg));
+        return args.length > 0 ? args : undefined;
+      }
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      const arg = rawType.slice(argStart, i).trim();
+      if (arg.length > 0) args.push(normalizeCppParamType(arg));
+      argStart = i + 1;
+    }
+  }
+
+  return undefined;
+}
+
 function findFuncDeclarator(node: SyntaxNode): SyntaxNode | null {
   let decl = node.childForFieldName('declarator');
   if (decl === null) {
@@ -167,8 +256,14 @@ function findFuncDeclarator(node: SyntaxNode): SyntaxNode | null {
     }
     return null;
   }
-  // Unwrap pointer_declarator / reference_declarator
-  while (decl.type === 'pointer_declarator' || decl.type === 'reference_declarator') {
+  // Unwrap declarator wrappers. Deleted free functions are represented as
+  // `init_declarator(function_declarator, delete_expression)` by
+  // tree-sitter-cpp 0.23.
+  while (
+    decl.type === 'pointer_declarator' ||
+    decl.type === 'reference_declarator' ||
+    decl.type === 'init_declarator'
+  ) {
     const next = decl.childForFieldName('declarator');
     if (next === null) {
       // reference_declarator may not use field name
